@@ -67,6 +67,21 @@ def test_k_single_flip_change_is_exact():
         assert torch.allclose(dJ[~heads], torch.zeros_like(dJ[~heads]), atol=1e-14)
 
 
+def test_k_diag_hessian_subset_is_nonnegative_and_consistent():
+    pb = make_problem(seed=17)
+    geom = pb["geom"]
+    tq = torch.arange(1, pb["T"])
+    sub = torch.tensor([0, 4, 7])
+    x = pb["xs"][0]
+    kc_sub = kcaches(pb, tq, pb["Wq_hat"], sub=sub)[0]
+    H_sub = k_seq_stats(kc_sub, x, pb["cos"], pb["sin"], pb["Wk_hat"], pb["bk"], geom, need_H=True, head_chunk=2)["H"]
+    assert H_sub.min() > -1e-12
+    # subset estimate == (n_q / n_sub) * exact H restricted to those queries
+    kc_only = kcaches(pb, tq[sub], pb["Wq_hat"], sub=None)[0]
+    H_only = k_seq_stats(kc_only, x, pb["cos"], pb["sin"], pb["Wk_hat"], pb["bk"], geom, need_H=True)["H"]
+    assert torch.allclose(H_sub, (tq.numel() / sub.numel()) * H_only, atol=1e-12)
+
+
 def test_k_accept_set_is_exact_and_updates():
     pb = make_problem(seed=14)
     geom = pb["geom"]

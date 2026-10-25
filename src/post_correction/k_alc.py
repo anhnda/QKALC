@@ -8,9 +8,9 @@ KV group g (GQA: one K row serves `group` query heads). Hence, exactly,
     G[(g,r), i] = s/N   sum_{j in g} sum_t sum_s w_ts x_s[i] Z_ts[r],      w = p (eps - mean_p eps)
     H[(g,r), i] = s^2/N sum_{j in g} sum_t Var_{p_t}( x_s[i] Z_ts[r] )
 G uses B_s = sum_t w_ts u_t and A_s = P_s^T B_s, so G = s/N * A_g^T X (no per-query loop).
-H = E1 - E2: E1 = sum_s x_s[i]^2 sum_t p_ts Z_ts[r]^2 is exact and cheap; E2 = sum_t (sum_s p x Z)^2
-needs a (d x h) tensor per query, so it is computed on `h_sub_queries_per_seq` queries and
-rescaled (unbiased). Interactions between flips are left to the exact acceptance check,
+H = E1 - E2 with E1 = sum_t sum_s p x^2 Z^2 and E2 = sum_t (sum_s p x Z)^2. E2 needs a (d x h)
+tensor per query, so BOTH terms are computed on the same `h_sub_queries_per_seq` queries and
+rescaled (unbiased, and non-negative per query). Interactions between flips are left to the exact acceptance check,
 which recomputes eps on the acceptance queries for the proposed batch (per KV group).
 """
 
@@ -32,7 +32,7 @@ class KALCConfig:
     accept: str = "exact"             # exact | none
     max_flip_percent: float = 0.05
     queries_per_seq: int = 256
-    h_sub_queries_per_seq: int = 8    # queries per seq used for the variance correction of diag H
+    h_sub_queries_per_seq: int = 32   # queries per seq for diag H (both moments); 0 = all (exact)
     accept_queries_per_seq: int = 32
     exclude_first: int = 1
     batch_init: int = 16              # small batches: the diag-only predictor ignores interactions,
@@ -105,18 +105,21 @@ def k_seq_stats(kc: KSeqCache, x, cos, sin, Wk_hat, bk, geom: AttnGeometry, need
     out["G"] = torch.matmul(Ag.transpose(1, 2), x).reshape(nkv * h, d)
 
     if need_H:
+        # Both terms of Var = E[a^2] - E[a]^2 on the SAME query subset: every query contributes a
+        # non-negative variance. (Mixing a full-sample E1 with a rescaled small-sample E2 cancels
+        # catastrophically for sink-dominated heads and drives H to 0 -> optimistic predictions.)
         h2 = h // 2
-        U = kc.U
-        PT = p.transpose(1, 2)                                      # (nh, T, n_q)
-        e2 = torch.matmul(PT, U * U)
-        eab = torch.matmul(PT, U[..., :h2] * U[..., h2:])
-        E1 = rope_diag_var(torch.zeros_like(e2), e2, eab, cosT[None], sinT[None])   # sum_t p Z^2
-        E1g = E1.view(nkv, g, T, h).sum(1)
-        H1 = torch.matmul(E1g.transpose(1, 2), x * x)                # (nkv, h, d)
-
         n_q = kc.tq.numel()
         sub = kc.sub if kc.sub is not None else torch.arange(n_q, device=x.device)
         ns = sub.numel()
+        U_s = kc.U[:, sub]                                          # (nh, ns, h)
+        PT = p[:, sub].transpose(1, 2)                              # (nh, T, ns)
+        e2 = torch.matmul(PT, U_s * U_s)
+        eab = torch.matmul(PT, U_s[..., :h2] * U_s[..., h2:])
+        E1 = rope_diag_var(torch.zeros_like(e2), e2, eab, cosT[None], sinT[None])   # sum_t p Z^2
+        E1g = E1.view(nkv, g, T, h).sum(1)
+        H1 = torch.matmul(E1g.transpose(1, 2), x * x)                # (nkv, h, d)
+        U = kc.U
         H2 = torch.zeros(nkv, h, d, device=x.device, dtype=x.dtype)
         cT = cosT[:, :h2].t()[None, None]                           # (1, 1, h2, T)
         sT = sinT[:, :h2].t()[None, None]
@@ -134,7 +137,7 @@ def k_seq_stats(kc: KSeqCache, x, cos, sin, Wk_hat, bk, geom: AttnGeometry, need
             e2h = torch.cat([(ma * ma).sum(1), (mb * mb).sum(1)], dim=1)   # (hc, h, d)
             H2.index_add_(0, gidx[hs], e2h)
             del ps, Us, Cx, Sx, ma, mb, e2h
-        out["H"] = (H1 - (n_q / ns) * H2).reshape(nkv * h, d)
+        out["H"] = ((n_q / ns) * (H1 - H2)).reshape(nkv * h, d)
     return out
 
 

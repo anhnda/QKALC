@@ -106,8 +106,8 @@ def build_parser():
     g.add_argument("--qk-accept", choices=["exact", "none"], default="exact")
     g.add_argument("--qk-layers", default="all", help='e.g. "all", "0-7,31"')
     g.add_argument("--qk-schedule", default="Q", help='passes in order: "Q", "K", "QK", "QKQ", ...')
-    g.add_argument("--qk-k-hsub-queries", type=int, default=8,
-                   help="K-pass: queries per seq for the variance part of diag H (unbiased subsample)")
+    g.add_argument("--qk-k-hsub-queries", type=int, default=32,
+                   help="K-pass: queries per seq used for diag H (both moments on the same subset); 0 = all")
     g.add_argument("--qk-k-refresh-every", type=int, default=5, help="K-pass: exact G refresh period")
     g.add_argument("--qk-k-batch-init", type=int, default=16, help="K-pass: initial flips per KV group per round")
     g.add_argument("--qk-k-batch-max", type=int, default=64, help="K-pass: max flips per KV group per round")

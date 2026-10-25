@@ -125,6 +125,14 @@ ARMS=rtn,rtn_clcq,rtn_qk BITS=3 bash scripts/rtn/run_rtn_ablation.sh
 | `rtn_qk_acc64`, `rtn_qk_acc1024` | Kích thước tập chấp nhận |
 | `rtn_qk_f02`, `rtn_qk_f10` | Flip budget |
 
+Llama-3-8B (cấu hình đã chốt từ thí nghiệm trên 1B), chạy theo giai đoạn:
+
+```bash
+PHASE=smoke bash scripts/llama3_8b/run_8b.sh                 # layer 0-1, kiểm tra API/OOM và k_sp > 0
+PHASE=rtn BITS_LIST="3 4" bash scripts/llama3_8b/run_8b.sh
+PHASE=awq BITS_LIST="3 4" bash scripts/llama3_8b/run_8b.sh
+```
+
 Sau đó chạy AWQ:
 
 ```bash
