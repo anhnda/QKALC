@@ -21,6 +21,12 @@ want_arm rtn_qk          && run_arm "$OUT" rtn_qk          --base rtn --qk-corre
 want_arm rtn_clc_qk      && run_arm "$OUT" rtn_clc_qk      --base rtn --clc-targets all --qk-correct full
 want_arm rtn_clcnq_qk    && run_arm "$OUT" rtn_clcnq_qk    --base rtn --clc-targets all_but_q --qk-correct full
 
+# --- K-pass (Q fixed) and alternating schedules
+want_arm rtn_k           && run_arm "$OUT" rtn_k           --base rtn --qk-correct full --qk-schedule K
+want_arm rtn_qkq         && run_arm "$OUT" rtn_qkq         --base rtn --qk-correct full --qk-schedule QKQ
+want_arm rtn_kq          && run_arm "$OUT" rtn_kq          --base rtn --qk-correct full --qk-schedule KQ
+want_arm rtn_clcnq_qkq   && run_arm "$OUT" rtn_clcnq_qkq   --base rtn --clc-targets all_but_q --qk-correct full --qk-schedule QKQ
+
 # --- step 3: ablations of the QK correction (on plain RTN)
 want_arm rtn_qk_mq       && run_arm "$OUT" rtn_qk_mq       --base rtn --qk-correct meanquery --qk-accept none
 want_arm rtn_qk_mq_acc   && run_arm "$OUT" rtn_qk_mq_acc   --base rtn --qk-correct meanquery --qk-accept exact

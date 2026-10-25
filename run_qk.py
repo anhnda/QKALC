@@ -27,6 +27,7 @@ from src.calibration import get_wikitext2_calibration_data, load_calibration_dat
 from src.io_utils import dump_json
 from src.pipeline.sequential import PipelineConfig, SequentialPipeline, parse_layer_spec
 from src.post_correction.clc import CLCConfig, CLCCorrection
+from src.post_correction.k_alc import KALCConfig, KLatticeCorrector
 from src.post_correction.qk_alc import QKALCConfig, QKLatticeCorrector
 
 
@@ -104,6 +105,10 @@ def build_parser():
     g.add_argument("--qk-correct", choices=["none", "full", "meanquery"], default="none")
     g.add_argument("--qk-accept", choices=["exact", "none"], default="exact")
     g.add_argument("--qk-layers", default="all", help='e.g. "all", "0-7,31"')
+    g.add_argument("--qk-schedule", default="Q", help='passes in order: "Q", "K", "QK", "QKQ", ...')
+    g.add_argument("--qk-k-hsub-queries", type=int, default=8,
+                   help="K-pass: queries per seq for the variance part of diag H (unbiased subsample)")
+    g.add_argument("--qk-k-refresh-every", type=int, default=5, help="K-pass: exact G refresh period")
     g.add_argument("--qk-max-flip-percent", type=float, default=0.05)
     g.add_argument("--qk-opt-seqs", type=int, default=64)
     g.add_argument("--qk-accept-seqs", type=int, default=16)
@@ -162,7 +167,7 @@ def auto_run_name(args) -> str:
         parts.append(f"clc-{args.clc_targets}")
         qk = args.qk_correct
         if qk != "none":
-            qk += f"-{args.qk_accept}-k{args.qk_strata}-f{args.qk_max_flip_percent:g}"
+            qk += f"-{args.qk_schedule}-{args.qk_accept}-k{args.qk_strata}-f{args.qk_max_flip_percent:g}"
         parts.append(f"qk-{qk}")
     parts.append(ts)
     return "_".join(parts)
@@ -174,6 +179,8 @@ def summarize_layers(layers: list) -> dict:
     if not layers:
         return out
     out["qk_flips_total"] = int(sum(l["qk"]["flips_total"] for l in layers if "qk" in l))
+    out["q_flips_total"] = int(sum(l["qk"].get("q_flips", 0) for l in layers if "qk" in l))
+    out["k_flips_total"] = int(sum(l["qk"].get("k_flips", 0) for l in layers if "qk" in l))
     out["qk_time_s"] = float(sum(l["qk"]["time_total_s"] for l in layers if "qk" in l))
     mems = [l["qk"]["peak_mem_gb"] for l in layers if "qk" in l and l["qk"]["peak_mem_gb"] is not None]
     out["qk_peak_mem_gb"] = max(mems) if mems else None
@@ -283,6 +290,26 @@ def main():
                 audit_every=args.qk_audit_every,
                 seed=args.seed,
             ))
+        kqk = None
+        if args.qk_correct != "none" and "K" in args.qk_schedule.upper():
+            kqk = KLatticeCorrector(KALCConfig(
+                accept=args.qk_accept,
+                max_flip_percent=args.qk_max_flip_percent,
+                queries_per_seq=args.qk_queries_per_seq,
+                h_sub_queries_per_seq=args.qk_k_hsub_queries,
+                accept_queries_per_seq=args.qk_accept_queries_per_seq,
+                exclude_first=args.exclude_first,
+                batch_init=args.qk_batch_init,
+                batch_max=args.qk_batch_max,
+                row_cap=args.qk_row_cap,
+                max_rounds=args.qk_max_rounds,
+                refresh_every=args.qk_k_refresh_every,
+                patience=args.qk_patience,
+                accept_margin=args.qk_accept_margin,
+                min_residual=args.qk_min_residual,
+                head_chunk=args.qk_head_chunk,
+                seed=args.seed,
+            ))
 
         n_layers = len(model.model.layers)
         pcfg = PipelineConfig(
@@ -293,6 +320,7 @@ def main():
             awq_max_rows=args.awq_max_rows,
             clc_targets=args.clc_targets,
             qk_layers=parse_layer_spec(args.qk_layers, n_layers),
+            qk_schedule=args.qk_schedule.upper(),
             n_opt=args.qk_opt_seqs,
             n_acc=args.qk_accept_seqs,
             exclude_first=args.exclude_first,
@@ -301,7 +329,7 @@ def main():
             diag=args.diag,
             diag_head_chunk=args.diag_head_chunk,
         )
-        pipe = SequentialPipeline(model, pcfg, clc=clc, qk=qk, device=args.device)
+        pipe = SequentialPipeline(model, pcfg, clc=clc, qk=qk, kqk=kqk, device=args.device)
         layers = pipe.run(calib, diag_ids)
         dump_json(out_dir / "layers.json", layers)
         summary["layers"] = summarize_layers(layers)

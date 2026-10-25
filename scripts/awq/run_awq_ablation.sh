@@ -15,7 +15,9 @@ want_arm awq_clc         && run_arm "$OUT" awq_clc         --base awq --clc-targ
 want_arm awq_qk          && run_arm "$OUT" awq_qk          --base awq --qk-correct full
 want_arm awq_clc_qk      && run_arm "$OUT" awq_clc_qk      --base awq --clc-targets all --qk-correct full
 want_arm awq_clcnq_qk    && run_arm "$OUT" awq_clcnq_qk    --base awq --clc-targets all_but_q --qk-correct full
-want_arm awq_qk_mq       && run_arm "$OUT" awq_qk_mq       --base awq --qk-correct meanquery --qk-accept none
+want_arm awq_qkq         && run_arm "$OUT" awq_qkq         --base awq --qk-correct full --qk-schedule QKQ
+want_arm awq_clcnq_qkq   && run_arm "$OUT" awq_clcnq_qkq   --base awq --clc-targets all_but_q --qk-correct full --qk-schedule QKQ
+want_arm awq_qk_mq      && run_arm "$OUT" awq_qk_mq       --base awq --qk-correct meanquery --qk-accept none
 want_arm awq_qk_noacc    && run_arm "$OUT" awq_qk_noacc    --base awq --qk-correct full --qk-accept none
 want_arm awq_qk_k1       && run_arm "$OUT" awq_qk_k1       --base awq --qk-correct full --qk-strata 1
 

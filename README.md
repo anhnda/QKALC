@@ -47,6 +47,18 @@ Với mỗi layer, sau khi base quantizer chạy xong và giữ K cố định:
 - **Làm mới.** $G$ được tính lại chính xác sau mỗi `--qk-refresh-every` vòng.
 - **Ràng buộc lattice.** Chỉ có flip bù sang mức kề bên kia của `pre_round`, mỗi weight tối đa một lần, có budget theo hàng (`--qk-max-flip-percent`). Code luôn nằm trong range, nên định dạng integer và kernel không đổi.
 
+**K-pass** (`src/post_correction/k_alc.py`) dùng cùng objective, nhưng giữ Q cố định và sửa lattice của `k_proj`:
+
+- Với $u_t=P_t\hat q_t$ và $Z_{ts}=P_s^\top u_t$, flip tại $W_K[(g,r),i]$ thay đổi $\varepsilon_{ts}$ một lượng $\delta\,s\,x_{s,i}Z_{ts,r}$, ở **mọi** head thuộc nhóm KV $g$ (GQA).
+- Gradient được tính chính xác: $G=\tfrac{s}{N}A_g^\top X$, trong đó $A_s=P_s^\top\sum_t w_{ts}u_t$, cộng qua các head trong nhóm.
+- Đường chéo Hessian $H=E_1-E_2$:
+  - $E_1$ tính chính xác;
+  - $E_2=\sum_t(\sum_s p\,x\,Z)^2$ được ước lượng không chệch trên `--qk-k-hsub-queries` query mỗi chuỗi.
+- Tương tác giữa các flip không được mô hình hoá trước. Thay vào đó, bước chấp nhận tính lại $\varepsilon$ **chính xác** trên tập chấp nhận và quyết định nhận hay bỏ theo từng nhóm KV.
+- $G$ được làm mới chính xác sau mỗi `--qk-k-refresh-every` vòng.
+
+Thứ tự các pass do `--qk-schedule` quyết định, ví dụ `Q`, `K`, `QK`, `QKQ`. Pass sau tính lại thống kê theo trọng số mới nhất của pass trước. Một weight đã flip ở pass trước thì bị khoá, và vẫn bị tính vào budget của hàng đó. Q-pass và K-pass dùng cùng các vị trí query cho cùng seed, nên $J$ của chúng so sánh trực tiếp được.
+
 Các chế độ:
 
 | Flag | Ý nghĩa |
@@ -106,6 +118,8 @@ ARMS=rtn,rtn_clcq,rtn_qk BITS=3 bash scripts/rtn/run_rtn_ablation.sh
 | `rtn_qk_mq`, `rtn_qk_mq_acc` | Mean-query vs query thật (đo giá trị của việc tính đến QF) |
 | `rtn_qk_noacc` | Có/không tập chấp nhận (đo winner's curse) |
 | `rtn_qk_k1` vs `rtn_qk_k3audit` | Kronecker $K=1$ vs $K=3$ (cột `audit_pearson` trong bảng) |
+| `rtn_k`, `rtn_qkq`, `rtn_kq` | K-pass riêng; Q→K→Q; K→Q |
+| `rtn_clcnq_qkq` | CLC cho mọi layer trừ q, sau đó Q→K→Q |
 | `rtn_qk_acc64`, `rtn_qk_acc1024` | Kích thước tập chấp nhận |
 | `rtn_qk_f02`, `rtn_qk_f10` | Flip budget |
 

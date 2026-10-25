@@ -22,7 +22,7 @@ from typing import Callable, Optional
 import torch
 
 from src.attention.geometry import AttnGeometry
-from src.attention.qk_stats import build_seq_cache, compute_seq_stats, query_mean
+from src.attention.qk_stats import build_seq_cache, compute_seq_stats, query_mean, sample_queries
 
 
 @dataclass
@@ -60,6 +60,8 @@ class LatticeHandle:
     scale_eff: torch.Tensor
     min_int: int
     max_int: int
+    codes_ref: Optional[torch.Tensor] = None  # codes before any QK pass; changed weights are frozen
+                                              # and count against the per-row budget in later passes
 
     def weight(self) -> torch.Tensor:
         return (self.codes - self.zp) * self.scale_eff
@@ -68,13 +70,15 @@ class LatticeHandle:
     def from_lattice_state(cls, lat) -> "LatticeHandle":
         st = lat.state
         d = st.in_features
+        codes = st.integer_weights[:, :d].clone()
         return cls(
-            codes=st.integer_weights[:, :d].clone(),
+            codes=codes,
             pre=st.pre_round[:, :d].clone(),
             zp=st.zero_point[:, :d].clone(),
             scale_eff=st.scale[:, :d] / lat.in_scales[None, :],
             min_int=st.min_int,
             max_int=st.max_int,
+            codes_ref=codes.clone(),
         )
 
     def write_back(self, lat):
@@ -179,15 +183,7 @@ class QKLatticeCorrector:
 
     # ------------------------------------------------------------------ helpers
     def _sample(self, T: int, n: int, n_sub: Optional[int], seed: int):
-        g = torch.Generator().manual_seed(int(seed))
-        lo = min(max(self.config.exclude_first, 0), T - 1)
-        cand = T - lo
-        n = max(1, min(int(n), cand))
-        tq = (torch.randperm(cand, generator=g)[:n] + lo).sort().values
-        sub = None
-        if n_sub is not None and n_sub > 0:
-            sub = torch.randperm(n, generator=g)[: min(int(n_sub), n)].sort().values
-        return tq, sub
+        return sample_queries(T, n, n_sub, seed, self.config.exclude_first)
 
     def _opt_pass(self, W, geom: AttnGeometry, bq, out: int, need_c: bool):
         nh, s = geom.n_heads, geom.scaling
@@ -393,8 +389,11 @@ class QKLatticeCorrector:
         budget_row = int(cfg.max_flip_percent * d)
 
         used = torch.zeros_like(valid)
+        if lattice.codes_ref is not None:
+            used = lattice.codes != lattice.codes_ref
         blocked = torch.zeros_like(valid)
-        row_count = torch.zeros(out, dtype=torch.long, device=dev)
+        row_count = used.sum(1).long()
+        row_count0 = row_count.clone()
         bsize = torch.full((nh,), max(1, cfg.batch_init), dtype=torch.long, device=dev)
         rejects = torch.zeros(nh, dtype=torch.long, device=dev)
         finished = torch.zeros(nh, dtype=torch.bool, device=dev)
@@ -500,8 +499,9 @@ class QKLatticeCorrector:
                 break
 
         _, J_opt1 = self._opt_pass(W_cur, geom, bq, out, need_c=False)
-        flips_head = row_count.view(nh, h).sum(1)
+        flips_head = (row_count - row_count0).view(nh, h).sum(1)
         log = {
+            "pass": "Q",
             "config": asdict(cfg),
             "rounds": rounds,
             "refreshes": n_refresh,

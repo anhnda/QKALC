@@ -26,6 +26,7 @@ from src.attention.geometry import get_attn_geometry
 from src.attention.qk_diag import attention_kl_diagnostics
 from src.attention.qk_stats import query_mean
 from src.attention.rope import compute_rope_tables
+from src.post_correction.k_alc import KLatticeCorrector
 from src.post_correction.qk_alc import LatticeHandle, QKLatticeCorrector
 from src.quantization.base import ActStats, quantize_linear, rows_per_call_for
 
@@ -39,6 +40,7 @@ class PipelineConfig:
     awq_max_rows: int = 2048
     clc_targets: str = "none"         # none | q | all | all_but_q
     qk_layers: Optional[set] = None   # None = all layers (when a QK corrector is given)
+    qk_schedule: str = "Q"            # sequence of passes, e.g. "Q", "K", "QK", "QKQ"
     n_opt: int = 64                   # calibration seqs [0, n_opt) -> QK optimisation statistics
     n_acc: int = 16                   # calibration seqs [n_opt, n_opt + n_acc) -> QK acceptance set
     exclude_first: int = 1
@@ -65,12 +67,50 @@ def parse_layer_spec(spec: Optional[str], n_layers: int) -> Optional[set]:
     return {i for i in out if 0 <= i < n_layers}
 
 
+def merge_pass_logs(logs: list) -> dict:
+    """Combine Q/K pass logs of one layer: first 'before', last 'after', summed flips/time."""
+    first, last = logs[0], logs[-1]
+    hist = {k: [] for k in ("pred", "acc", "accepted", "nsel", "audit_pred", "audit_exact_opt", "audit_acc")}
+    with_acc = [lg for lg in logs if lg.get("history", {}).get("acc")]
+    for lg in (with_acc if with_acc else logs):          # keep pred/acc aligned
+        h = lg.get("history", {})
+        for k in ("pred", "acc", "accepted", "nsel"):
+            hist[k] += h.get(k, [])
+    for lg in logs:
+        h = lg.get("history", {})
+        for k in ("audit_pred", "audit_exact_opt", "audit_acc"):
+            hist[k] += h.get(k, [])
+    mems = [lg["peak_mem_gb"] for lg in logs if lg.get("peak_mem_gb") is not None]
+    return {
+        "schedule": "".join(lg["pass"] for lg in logs),
+        "rounds": int(sum(lg["rounds"] for lg in logs)),
+        "flips_total": int(sum(lg["flips_total"] for lg in logs)),
+        "q_flips": int(sum(lg["flips_total"] for lg in logs if lg["pass"] == "Q")),
+        "k_flips": int(sum(lg["flips_total"] for lg in logs if lg["pass"] == "K")),
+        "J_opt_before": first["J_opt_before"],
+        "J_opt_after": last["J_opt_after"],
+        "J_acc_before": first["J_acc_before"],
+        "J_acc_after": last["J_acc_after"],
+        "history": hist,
+        "time_total_s": float(sum(lg["time_total_s"] for lg in logs)),
+        "peak_mem_gb": max(mems) if mems else None,
+    }
+
+
 class SequentialPipeline:
-    def __init__(self, model, cfg: PipelineConfig, clc=None, qk: Optional[QKLatticeCorrector] = None, device: str = "cuda"):
+    def __init__(self, model, cfg: PipelineConfig, clc=None, qk: Optional[QKLatticeCorrector] = None,
+                 kqk: Optional[KLatticeCorrector] = None, device: str = "cuda"):
         self.model = model
         self.cfg = cfg
         self.clc = clc
         self.qk = qk
+        self.kqk = kqk
+        sched = cfg.qk_schedule.upper()
+        if any(c not in "QK" for c in sched) or not sched:
+            raise ValueError(f"bad qk_schedule {cfg.qk_schedule!r}")
+        if qk is not None and "K" in sched and kqk is None:
+            raise ValueError("schedule contains K but no K corrector was given")
+        self.schedule = sched
         self.device = torch.device(device)
         self.dtype = next(model.parameters()).dtype
         self._mask_cache = {}
@@ -211,18 +251,22 @@ class SequentialPipeline:
             Wk = attn.k_proj.weight.detach().float().clone()
             bq = None if attn.q_proj.bias is None else attn.q_proj.bias.detach().float().clone()
             bk = None if attn.k_proj.bias is None else attn.k_proj.bias.detach().float().clone()
-            q_lat = None
+            q_lat = k_lat = None
             lin_info = {}
             for n, m in lin.items():
                 is_q = n.endswith("q_proj")
+                is_k = n.endswith("k_proj")
+                keep = do_qk and ((is_q and "Q" in self.schedule) or (is_k and "K" in self.schedule))
                 lat, info = quantize_linear(
                     m, cfg.base, cfg.bits, cfg.group_size,
                     act=stats.get(n), clc=self.clc if self._use_clc(n) else None,
                     awq_n_grid=cfg.awq_n_grid, awq_max_rows=cfg.awq_max_rows,
-                    keep_state=is_q and do_qk,
+                    keep_state=keep,
                 )
                 if is_q:
                     q_lat = lat
+                if is_k:
+                    k_lat = lat
                 lin_info[n] = info
             stats.clear()
 
@@ -235,24 +279,43 @@ class SequentialPipeline:
             if diag_inps is not None:
                 rep["diag_before"] = self._diag(layer, geom, diag_inps, Wq, bq, Wk, bk, mu)
 
-            # 4. QK correction
+            # 4. QK correction (passes in schedule order, e.g. Q, K, Q)
             if do_qk:
-                handle = LatticeHandle.from_lattice_state(q_lat)
-                n_acc = cfg.n_acc if self.qk.config.accept == "exact" else 0
-                qk_log = self.qk.correct(
-                    geom=geom, cos=self.cos32, sin=self.sin32,
-                    opt_x=self._x_fn(layer, inps, 0), n_opt=cfg.n_opt,
-                    acc_x=self._x_fn(layer, inps, cfg.n_opt) if n_acc > 0 else None, n_acc=n_acc,
-                    Wq_fp=Wq, bq=bq, Wk_fp=Wk, bk=bk, Wk_hat=attn.k_proj.weight.detach().float(),
-                    lattice=handle, mu=mu,
-                )
-                handle.write_back(q_lat)
-                attn.q_proj.weight.data.copy_(handle.weight().to(attn.q_proj.weight.dtype))
-                rep["qk"] = qk_log
-                del handle
+                qh = LatticeHandle.from_lattice_state(q_lat) if q_lat is not None else None
+                kh = LatticeHandle.from_lattice_state(k_lat) if k_lat is not None else None
+                opt_x = self._x_fn(layer, inps, 0)
+                acc_fn = self._x_fn(layer, inps, cfg.n_opt)
+                logs = []
+                for step in self.schedule:
+                    Wq_cur = qh.weight() if qh is not None else attn.q_proj.weight.detach().float()
+                    Wk_cur = kh.weight() if kh is not None else attn.k_proj.weight.detach().float()
+                    if step == "Q":
+                        n_acc = cfg.n_acc if self.qk.config.accept == "exact" else 0
+                        lg = self.qk.correct(
+                            geom=geom, cos=self.cos32, sin=self.sin32,
+                            opt_x=opt_x, n_opt=cfg.n_opt, acc_x=acc_fn if n_acc > 0 else None, n_acc=n_acc,
+                            Wq_fp=Wq, bq=bq, Wk_fp=Wk, bk=bk, Wk_hat=Wk_cur, lattice=qh, mu=mu,
+                        )
+                        attn.q_proj.weight.data.copy_(qh.weight().to(attn.q_proj.weight.dtype))
+                    else:
+                        n_acc = cfg.n_acc if self.kqk.config.accept == "exact" else 0
+                        lg = self.kqk.correct(
+                            geom=geom, cos=self.cos32, sin=self.sin32,
+                            opt_x=opt_x, n_opt=cfg.n_opt, acc_x=acc_fn if n_acc > 0 else None, n_acc=n_acc,
+                            Wq_fp=Wq, bq=bq, Wk_fp=Wk, bk=bk, Wq_hat=Wq_cur, lattice=kh,
+                        )
+                        attn.k_proj.weight.data.copy_(kh.weight().to(attn.k_proj.weight.dtype))
+                    logs.append(lg)
+                if qh is not None:
+                    qh.write_back(q_lat)
+                if kh is not None:
+                    kh.write_back(k_lat)
+                rep["qk"] = merge_pass_logs(logs)
+                rep["qk_passes"] = [{k: v for k, v in lg.items() if k != "history"} for lg in logs]
+                del qh, kh
                 if diag_inps is not None:
                     rep["diag_after"] = self._diag(layer, geom, diag_inps, Wq, bq, Wk, bk, mu)
-            del q_lat
+            del q_lat, k_lat
 
             # 5. propagate
             inps = self._propagate(layer, inps)
@@ -266,7 +329,7 @@ class SequentialPipeline:
                     msg += f" KL_full={rep['diag_before']['kl_full']['mean']:.3e}"
                 if "qk" in rep:
                     q = rep["qk"]
-                    msg += f" | QK flips={q['flips_total']} rounds={q['rounds']}"
+                    msg += f" | {q['schedule']} flips Q={q['q_flips']} K={q['k_flips']} rounds={q['rounds']}"
                     if "diag_after" in rep:
                         msg += f" KL_full->{rep['diag_after']['kl_full']['mean']:.3e}"
                     if q["J_acc_before"] is not None:

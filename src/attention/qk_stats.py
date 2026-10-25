@@ -156,6 +156,20 @@ def compute_seq_stats(
     return out
 
 
+def sample_queries(T: int, n: int, n_sub: Optional[int], seed: int, exclude_first: int = 1):
+    """Deterministic query positions in [exclude_first, T) and an optional sub-index set.
+    Shared by the Q- and K-passes so both see the same queries for the same seed."""
+    g = torch.Generator().manual_seed(int(seed))
+    lo = min(max(exclude_first, 0), T - 1)
+    cand = T - lo
+    n = max(1, min(int(n), cand))
+    tq = (torch.randperm(cand, generator=g)[:n] + lo).sort().values
+    sub = None
+    if n_sub is not None and n_sub > 0:
+        sub = torch.randperm(n, generator=g)[: min(int(n_sub), n)].sort().values
+    return tq, sub
+
+
 @torch.no_grad()
 def query_mean(x_fn: Callable[[int], torch.Tensor], n: int, exclude_first: int = 1) -> torch.Tensor:
     """Mean of the attention input over positions >= exclude_first of sequences 0..n-1."""
