@@ -1,0 +1,10 @@
+numpy
+# torch: cài riêng theo phiên bản CUDA (xem README)
+transformers==4.45.0
+datasets==2.17.1
+accelerate
+tqdm
+psutil
+python-dotenv
+lm-eval==0.4.9.1
+pytest
