@@ -35,9 +35,9 @@ class KALCConfig:
     h_sub_queries_per_seq: int = 8    # queries per seq used for the variance correction of diag H
     accept_queries_per_seq: int = 32
     exclude_first: int = 1
-    batch_init: int = 64
-    batch_max: int = 512
-    row_cap: int = 4
+    batch_init: int = 16              # small batches: the diag-only predictor ignores interactions,
+    batch_max: int = 64               # and same-direction K flips overshoot (each K row feeds `group` heads)
+    row_cap: int = 1
     max_rounds: int = 200
     refresh_every: int = 5            # exact G refresh period (G is stale in between)
     patience: int = 8

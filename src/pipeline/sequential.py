@@ -311,7 +311,11 @@ class SequentialPipeline:
                 if kh is not None:
                     kh.write_back(k_lat)
                 rep["qk"] = merge_pass_logs(logs)
-                rep["qk_passes"] = [{k: v for k, v in lg.items() if k != "history"} for lg in logs]
+                rep["qk_passes"] = [
+                    {**{k: v for k, v in lg.items() if k != "history"},
+                     "history": {k: lg.get("history", {}).get(k, []) for k in ("pred", "acc", "accepted", "nsel")}}
+                    for lg in logs
+                ]
                 del qh, kh
                 if diag_inps is not None:
                     rep["diag_after"] = self._diag(layer, geom, diag_inps, Wq, bq, Wk, bk, mu)

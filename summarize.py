@@ -1,10 +1,14 @@
 #!/usr/bin/env python
 """Collect results/<dir>/*/summary.json (+ layers.json) into one table.
 
-    python summarize.py --results-dir results/rtn/Meta-Llama-3-8B_w3g128 [--csv out.csv]
+    python summarize.py --results-dir results/rtn/Llama-3.2-1B_w3g128 [--csv out.csv] [--runs a,b,c]
 
-Columns: PPL, mean attention KL over layers (before/after QK), MQ/QF split, flips, time,
-and the Spearman / Pearson correlation between predicted and exact acceptance dJ.
+Predictor quality is reported per pass type (Q / K), computed per layer and then
+summarised by the median over layers (pooling layers inflates Pearson because the
+dJ scale differs a lot between layers):
+    q_sp / k_sp     median per-layer Spearman(pred dJ, exact acceptance dJ)
+    q_acc / k_acc   fraction of proposed head/group batches that were accepted
+    q_bs / k_bs     mean proposed batch size (flips per head / per KV group)
 """
 
 from __future__ import annotations
@@ -26,69 +30,106 @@ def _rank(a):
 
 def _corr(x, y):
     x, y = np.asarray(x, float), np.asarray(y, float)
-    if len(x) < 3 or np.std(x) == 0 or np.std(y) == 0:
+    if len(x) < 5 or np.std(x) == 0 or np.std(y) == 0:
         return None, None
-    pear = float(np.corrcoef(x, y)[0, 1])
-    spear = float(np.corrcoef(_rank(x), _rank(y))[0, 1])
-    return pear, spear
+    return float(np.corrcoef(x, y)[0, 1]), float(np.corrcoef(_rank(x), _rank(y))[0, 1])
 
 
 def _fmt(v, nd=4):
     if v is None:
         return "-"
+    if isinstance(v, bool):
+        return str(v)
     if isinstance(v, float):
+        if v == 0:
+            return "0"
         return f"{v:.{nd}g}" if abs(v) < 1e-2 or abs(v) >= 1e4 else f"{v:.{nd}f}"
     return str(v)
 
 
-def collect(results_dir: Path):
+def _layer_passes(layer: dict, schedule: str):
+    """Yield (pass_type, history) for one layer; falls back to merged history for old runs."""
+    passes = layer.get("qk_passes") or []
+    if passes and all("history" in p for p in passes):
+        for p in passes:
+            yield p.get("pass", "Q"), p["history"]
+        return
+    h = (layer.get("qk") or {}).get("history")
+    if h and schedule in ("Q", "K"):
+        yield schedule, h
+
+
+def predictor_stats(layers: list, schedule: str) -> dict:
+    out = {}
+    for kind in ("Q", "K"):
+        sps, n_acc, n_tot, bs = [], 0, 0, []
+        for l in layers:
+            for k, h in _layer_passes(l, schedule):
+                if k != kind:
+                    continue
+                acc_flags = h.get("accepted", [])
+                n_acc += int(sum(bool(a) for a in acc_flags))
+                n_tot += len(acc_flags)
+                bs += h.get("nsel", [])
+                if h.get("acc") and len(h["acc"]) == len(h.get("pred", [])):
+                    _, sp = _corr(h["pred"], h["acc"])
+                    if sp is not None:
+                        sps.append(sp)
+        key = kind.lower()
+        out[f"{key}_sp"] = float(np.median(sps)) if sps else None
+        out[f"{key}_acc"] = (n_acc / n_tot) if n_tot else None
+        out[f"{key}_bs"] = float(np.mean(bs)) if bs else None
+    return out
+
+
+def collect(results_dir: Path, only=None):
     rows = []
     for sfile in sorted(results_dir.glob("*/summary.json")):
         s = json.loads(sfile.read_text())
         c = s.get("config", {})
+        name = c.get("run_name", sfile.parent.name)
+        if only and name not in only:
+            continue
         lay = s.get("layers", {})
+        qk_on = c.get("qk_correct", "none") != "none"
+        sched = c.get("qk_schedule", "Q") if qk_on else "-"
+        db = lay.get("diag_before") or {}
+        da = lay.get("diag_after") or {}
         row = {
-            "run": c.get("run_name", sfile.parent.name),
+            "run": name,
             "base": c.get("base"),
             "bits": c.get("bits") if c.get("base") != "none" else "-",
             "clc": c.get("clc_targets"),
             "qk": c.get("qk_correct"),
-            "kl_k_after": (lay.get("diag_after") or {}).get("kl_k_only"),
-            "accept": c.get("qk_accept") if c.get("qk_correct") != "none" else "-",
-            "strata": c.get("qk_strata") if c.get("qk_correct") != "none" else "-",
+            "sched": sched,
             "ppl_wiki": (s.get("ppl", {}).get("wikitext2") or {}).get("perplexity"),
             "ppl_c4": (s.get("ppl", {}).get("c4") or {}).get("perplexity"),
-            "kl_before": (lay.get("diag_before") or {}).get("kl_full"),
-            "kl_after": (lay.get("diag_after") or {}).get("kl_full"),
-            "kl_q_only": (lay.get("diag_before") or {}).get("kl_q_only"),
-            "kl_k_only": (lay.get("diag_before") or {}).get("kl_k_only"),
-            "kl_mq": (lay.get("diag_before") or {}).get("kl_mq"),
-            "kl_qf": (lay.get("diag_before") or {}).get("kl_qf"),
-            "sched": c.get("qk_schedule", "Q") if c.get("qk_correct") != "none" else "-",
-            "q_flips": lay.get("q_flips_total", lay.get("qk_flips_total")),
-            "k_flips": lay.get("k_flips_total"),
+            "kl_before": db.get("kl_full"),
+            "kl_after": da.get("kl_full"),
+            "kl_k_before": db.get("kl_k_only"),
+            "kl_k_after": da.get("kl_k_only"),
+            "kl_mq": db.get("kl_mq"),
+            "kl_qf": db.get("kl_qf"),
+            "q_flips": lay.get("q_flips_total", lay.get("qk_flips_total")) if qk_on else None,
+            "k_flips": lay.get("k_flips_total") if qk_on else None,
             "clc_flips": lay.get("clc_flips_total"),
             "J_acc": None,
             "qk_time_s": lay.get("qk_time_s"),
-            "qk_mem_gb": lay.get("qk_peak_mem_gb"),
-            "pearson": None,
-            "spearman": None,
+            "q_sp": None, "q_acc": None, "q_bs": None,
+            "k_sp": None, "k_acc": None, "k_bs": None,
             "audit_pearson": None,
         }
         if lay.get("J_acc_before_sum") is not None:
             row["J_acc"] = f"{lay['J_acc_before_sum']:.3e}->{lay['J_acc_after_sum']:.3e}"
         lfile = sfile.parent / "layers.json"
-        if lfile.exists() and c.get("qk_correct") not in (None, "none"):
+        if qk_on and lfile.exists():
             layers = json.loads(lfile.read_text())
-            pred, acc, ap, ae = [], [], [], []
+            row.update(predictor_stats(layers, sched))
+            ap, ae = [], []
             for l in layers:
                 h = (l.get("qk") or {}).get("history") or {}
-                if h.get("acc"):
-                    pred += h.get("pred", [])
-                    acc += h.get("acc", [])
                 ap += h.get("audit_pred", [])
                 ae += h.get("audit_exact_opt", [])
-            row["pearson"], row["spearman"] = _corr(pred, acc)
             row["audit_pearson"], _ = _corr(ap, ae)
         rows.append(row)
     return rows
@@ -98,8 +139,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--results-dir", required=True)
     ap.add_argument("--csv", default=None)
+    ap.add_argument("--runs", default=None, help="comma-separated run names to include")
     args = ap.parse_args()
-    rows = collect(Path(args.results_dir))
+    only = set(args.runs.split(",")) if args.runs else None
+    rows = collect(Path(args.results_dir), only)
     if not rows:
         print("no summary.json found")
         return

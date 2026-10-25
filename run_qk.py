@@ -109,6 +109,10 @@ def build_parser():
     g.add_argument("--qk-k-hsub-queries", type=int, default=8,
                    help="K-pass: queries per seq for the variance part of diag H (unbiased subsample)")
     g.add_argument("--qk-k-refresh-every", type=int, default=5, help="K-pass: exact G refresh period")
+    g.add_argument("--qk-k-batch-init", type=int, default=16, help="K-pass: initial flips per KV group per round")
+    g.add_argument("--qk-k-batch-max", type=int, default=64, help="K-pass: max flips per KV group per round")
+    g.add_argument("--qk-k-row-cap", type=int, default=1, help="K-pass: max flips per k_proj row per round")
+    g.add_argument("--qk-k-max-rounds", type=int, default=None, help="K-pass rounds (default: --qk-max-rounds)")
     g.add_argument("--qk-max-flip-percent", type=float, default=0.05)
     g.add_argument("--qk-opt-seqs", type=int, default=64)
     g.add_argument("--qk-accept-seqs", type=int, default=16)
@@ -299,10 +303,10 @@ def main():
                 h_sub_queries_per_seq=args.qk_k_hsub_queries,
                 accept_queries_per_seq=args.qk_accept_queries_per_seq,
                 exclude_first=args.exclude_first,
-                batch_init=args.qk_batch_init,
-                batch_max=args.qk_batch_max,
-                row_cap=args.qk_row_cap,
-                max_rounds=args.qk_max_rounds,
+                batch_init=args.qk_k_batch_init,
+                batch_max=args.qk_k_batch_max,
+                row_cap=args.qk_k_row_cap,
+                max_rounds=args.qk_k_max_rounds if args.qk_k_max_rounds is not None else args.qk_max_rounds,
                 refresh_every=args.qk_k_refresh_every,
                 patience=args.qk_patience,
                 accept_margin=args.qk_accept_margin,

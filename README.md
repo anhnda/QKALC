@@ -57,6 +57,8 @@ Với mỗi layer, sau khi base quantizer chạy xong và giữ K cố định:
 - Tương tác giữa các flip không được mô hình hoá trước. Thay vào đó, bước chấp nhận tính lại $\varepsilon$ **chính xác** trên tập chấp nhận và quyết định nhận hay bỏ theo từng nhóm KV.
 - $G$ được làm mới chính xác sau mỗi `--qk-k-refresh-every` vòng.
 
+K-pass dự đoán $\Delta J$ chỉ bằng đường chéo (không có tương tác), nên batch lớn gồm nhiều flip cùng chiều sẽ overshoot. Vì vậy K-pass có bộ tham số batch riêng, mặc định nhỏ: `--qk-k-batch-init 16 --qk-k-batch-max 64 --qk-k-row-cap 1`. Có thể chạy sweep bằng `scripts/rtn/run_kpass_sweep.sh`. Trong bảng tổng hợp, `q_sp` / `k_sp` là median theo layer của Spearman(ΔJ dự đoán, ΔJ chính xác); `q_acc` / `k_acc` là tỉ lệ batch được nhận; `q_bs` / `k_bs` là số flip trung bình mỗi batch.
+
 Thứ tự các pass do `--qk-schedule` quyết định, ví dụ `Q`, `K`, `QK`, `QKQ`. Pass sau tính lại thống kê theo trọng số mới nhất của pass trước. Một weight đã flip ở pass trước thì bị khoá, và vẫn bị tính vào budget của hàng đó. Q-pass và K-pass dùng cùng các vị trí query cho cùng seed, nên $J$ của chúng so sánh trực tiếp được.
 
 Các chế độ:
