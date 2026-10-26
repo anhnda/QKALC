@@ -43,6 +43,7 @@ if [[ "$PHASE" == "rtn" || "$PHASE" == "all" ]]; then
     want_arm rtn_qk              && run_arm "$OUT" rtn_qk              --base rtn "${QK[@]}" --qk-schedule Q
     want_arm rtn_qkq             && run_arm "$OUT" rtn_qkq             --base rtn "${QK[@]}" --qk-schedule QKQ
     want_arm rtn_clc             && run_arm "$OUT" rtn_clc             --base rtn --clc-targets all
+    want_arm rtn_clcnq_qk        && run_arm "$OUT" rtn_clcnq_qk        --base rtn --clc-targets all_but_q "${QK[@]}" --qk-schedule Q
     want_arm rtn_clcnq_qkq       && run_arm "$OUT" rtn_clcnq_qkq       --base rtn --clc-targets all_but_q "${QK[@]}" --qk-schedule QKQ
     want_arm rtn_clcnq_qkqkq     && run_arm "$OUT" rtn_clcnq_qkqkq     --base rtn --clc-targets all_but_q "${QK[@]}" --qk-schedule QKQKQ
     summ "$OUT"
@@ -57,6 +58,7 @@ if [[ "$PHASE" == "awq" || "$PHASE" == "all" ]]; then
     want_arm awq_qk              && run_arm "$OUT" awq_qk              --base awq "${QK[@]}" --qk-schedule Q
     want_arm awq_qkq             && run_arm "$OUT" awq_qkq             --base awq "${QK[@]}" --qk-schedule QKQ
     want_arm awq_clc             && run_arm "$OUT" awq_clc             --base awq --clc-targets all
+    want_arm awq_clcnq_qk        && run_arm "$OUT" awq_clcnq_qk        --base awq --clc-targets all_but_q "${QK[@]}" --qk-schedule Q
     want_arm awq_clcnq_qkq       && run_arm "$OUT" awq_clcnq_qkq       --base awq --clc-targets all_but_q "${QK[@]}" --qk-schedule QKQ
     summ "$OUT"
   done

@@ -103,6 +103,7 @@ def collect(results_dir: Path, only=None):
             "qk": c.get("qk_correct"),
             "sched": sched,
             "ppl_wiki": (s.get("ppl", {}).get("wikitext2") or {}).get("perplexity"),
+            "ppl_8k": (s.get("ppl", {}).get("wikitext2_ctx8192") or {}).get("perplexity"),
             "ppl_c4": (s.get("ppl", {}).get("c4") or {}).get("perplexity"),
             "kl_before": db.get("kl_full"),
             "kl_after": da.get("kl_full"),

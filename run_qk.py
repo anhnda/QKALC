@@ -154,6 +154,8 @@ def build_parser():
     g.add_argument("--c4-samples", type=int, default=500)
     g.add_argument("--ppl-stride", type=int, default=2048)
     g.add_argument("--ppl-max-length", type=int, default=2048)
+    g.add_argument("--ppl-extra-lengths", type=int, nargs="*", default=[],
+                   help="extra WikiText-2 PPL evaluations with context = stride = L (e.g. 8192)")
     g.add_argument("--eval-cache-dir", default="./data/cache/eval")
     g.add_argument("--lm-eval-tasks", nargs="*", default=[])
     g.add_argument("--lm-eval-batch-size", default="1")
@@ -350,6 +352,15 @@ def main():
         )
         ppl = {"wikitext2": ev.evaluate_sliding_window(model, tok, ev.load_wikitext2_test())}
         print(f"[ppl] wikitext2 = {ppl['wikitext2']['perplexity']:.4f}")
+        for L in args.ppl_extra_lengths:
+            evL = SlidingWindowEvaluator(
+                device=args.device, seed=args.seed, stride=L, max_length=L,
+                cache_dir=args.eval_cache_dir, hf_token=hf_token,
+            )
+            key = f"wikitext2_ctx{L}"
+            ppl[key] = evL.evaluate_sliding_window(model, tok, evL.load_wikitext2_test())
+            print(f"[ppl] {key} = {ppl[key]['perplexity']:.4f}")
+            torch.cuda.empty_cache()
         if args.eval_c4:
             ppl["c4"] = ev.evaluate_sliding_window(model, tok, ev.load_c4_validation(n_samples=args.c4_samples))
             print(f"[ppl] c4 = {ppl['c4']['perplexity']:.4f}")
