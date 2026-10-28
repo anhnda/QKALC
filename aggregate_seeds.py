@@ -33,14 +33,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dirs", nargs="+")
     ap.add_argument("--csv", default=None)
+    ap.add_argument(
+        "--pairs",
+        default="rtn_qk:rtn_clcq,rtn_clcnq_qk:rtn_clc,rtn_clcnq_qkq:rtn_clcnq_qk,rtn_qkq:rtn_qk",
+        help="comma-separated A:B; reports per-seed paired differences A - B (mean +- std)",
+    )
     args = ap.parse_args()
 
     vals = defaultdict(lambda: defaultdict(list))
+    per_dir = defaultdict(dict)   # dir -> run -> summary
     order = []
     for d in args.dirs:
         for f in sorted(Path(d).glob("*/summary.json")):
             s = json.loads(f.read_text())
             name = s.get("config", {}).get("run_name", f.parent.name)
+            per_dir[d][name] = s
             if name not in order:
                 order.append(name)
             for m, fn in METRICS:
@@ -71,6 +78,45 @@ def main():
             w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
             w.writerows(rows)
+
+    # paired differences within each seed folder (A - B); robust to seed-level shifts of the base
+    pairs = [p.split(":") for p in args.pairs.split(",") if ":" in p]
+    if pairs:
+        pm = [("ppl_wiki", METRICS[0][1]), ("ppl_8k", METRICS[1][1]), ("kl_after", METRICS[3][1])]
+        print("\nPaired differences A - B within each seed (negative = A better)")
+        print("| A - B | n | " + " | ".join(f"d_{m}" for m, _ in pm) + " | per-seed d_ppl_wiki |")
+        print("|---|---|" + "|".join(["---"] * len(pm)) + "|---|")
+        prow = []
+        for a, b in pairs:
+            diffs = {m: [] for m, _ in pm}
+            for d in args.dirs:
+                sa, sb = per_dir[d].get(a), per_dir[d].get(b)
+                if sa is None or sb is None:
+                    continue
+                for m, fn in pm:
+                    va, vb = fn(sa), fn(sb)
+                    if va is not None and vb is not None:
+                        diffs[m].append(float(va) - float(vb))
+            n = len(diffs["ppl_wiki"])
+            if n == 0:
+                continue
+            cells = []
+            for m, _ in pm:
+                xs = diffs[m]
+                if not xs:
+                    cells.append("-")
+                elif len(xs) == 1:
+                    cells.append(f"{xs[0]:+.4f}")
+                else:
+                    cells.append(f"{np.mean(xs):+.4f} ± {np.std(xs, ddof=1):.4f}")
+            per_seed = ", ".join(f"{x:+.4f}" for x in diffs["ppl_wiki"])
+            print(f"| {a} - {b} | {n} | " + " | ".join(cells) + f" | {per_seed} |")
+            prow.append({"pair": f"{a}-{b}", "n": n, **{f"d_{m}": c for (m, _), c in zip(pm, cells)}})
+        if args.csv and prow:
+            with open(args.csv.replace(".csv", "_paired.csv"), "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=list(prow[0].keys()))
+                w.writeheader()
+                w.writerows(prow)
 
 
 if __name__ == "__main__":
