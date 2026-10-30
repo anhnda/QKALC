@@ -82,6 +82,18 @@ def predictor_stats(layers: list, schedule: str) -> dict:
     return out
 
 
+LM_NORM_TASKS = {"arc_challenge", "hellaswag", "openbookqa"}  # report acc_norm for these, acc otherwise
+
+
+def lm_scores(s: dict) -> dict:
+    out = {}
+    for task, m in (s.get("lm_eval") or {}).items():
+        key = "acc_norm,none" if task in LM_NORM_TASKS and "acc_norm,none" in m else "acc,none"
+        if key in m:
+            out[task] = float(m[key])
+    return out
+
+
 def collect(results_dir: Path, only=None):
     rows = []
     for sfile in sorted(results_dir.glob("*/summary.json")):
@@ -132,21 +144,43 @@ def collect(results_dir: Path, only=None):
                 ap += h.get("audit_pred", [])
                 ae += h.get("audit_exact_opt", [])
             row["audit_pearson"], _ = _corr(ap, ae)
+        row["_lm"] = lm_scores(s)
         rows.append(row)
     return rows
 
 
+def add_lm_columns(rows: list):
+    tasks = sorted({t for r in rows for t in r["_lm"]})
+    for r in rows:
+        lm = r.pop("_lm")
+        for t in tasks:
+            r[f"lm_{t}"] = lm.get(t)
+        vals = [lm[t] for t in tasks if t in lm]
+        r["lm_avg"] = (sum(vals) / len(vals)) if tasks and len(vals) == len(tasks) else None
+    return tasks
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--results-dir", required=True)
+    ap.add_argument("--results-dir", required=True, nargs="+", help="one or more result folders")
     ap.add_argument("--csv", default=None)
     ap.add_argument("--runs", default=None, help="comma-separated run names to include")
+    ap.add_argument("--lm-only", action="store_true", help="only run, bits, PPL and lm-eval columns")
     args = ap.parse_args()
     only = set(args.runs.split(",")) if args.runs else None
-    rows = collect(Path(args.results_dir), only)
+    rows = []
+    for d in args.results_dir:
+        rows += collect(Path(d), only)
     if not rows:
         print("no summary.json found")
         return
+    tasks = add_lm_columns(rows)
+    if args.lm_only:
+        keep = ["run", "base", "bits", "clc", "qk", "sched", "ppl_wiki", "ppl_8k"] + [f"lm_{t}" for t in tasks] + ["lm_avg"]
+        rows = [{k: r[k] for k in keep} for r in rows]
+    elif not tasks:
+        for r in rows:
+            r.pop("lm_avg", None)
     cols = list(rows[0].keys())
     print("| " + " | ".join(cols) + " |")
     print("|" + "|".join(["---"] * len(cols)) + "|")
