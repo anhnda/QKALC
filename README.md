@@ -5,7 +5,7 @@ Project này phát triển từ repo CLC. Phần lõi của CLC được giữ n
 ## Cấu trúc
 
 ```
-run_qk.py                     entrypoint: base quant -> [CLC] -> [QK correction] -> diag -> PPL / lm-eval
+run_qk.py                     entrypoint: base quant (rtn|awq|gptq) -> [CLC] -> [QK correction] -> diag -> PPL / lm-eval
 summarize.py                  gom results/*/summary.json thành bảng (markdown/CSV)
 src/
   calibration.py              (giữ từ repo) C4 / WikiText-2 calibration, có cache
@@ -13,6 +13,7 @@ src/
   quantization/
     state.py                  (giữ từ repo) IntegerQuantizedTensorState
     base.py                   group-wise RTN + AWQ search (tách từ repo awq.py), ActStats, quantize_linear
+    gptq.py                   MỚI: GPTQ (act-order, static/dynamic groups) xuất ra cùng lattice
   post_correction/
     clc.py                    (giữ nguyên từ repo) CLC gốc: baseline
     qk_alc.py                 MỚI: QKLatticeCorrector, KronCurvature (PSD), AcceptCache
@@ -27,7 +28,9 @@ scripts/
   common.sh                   biến chung (MODEL_PATH, BITS, FLIP, ...)
   rtn/run_rtn_ablation.sh     các arm RTN (chạy trước)
   awq/run_awq_ablation.sh     các arm AWQ (chạy sau)
+  gptq/run_gptq_ablation.sh   các arm GPTQ (T3: QK còn bổ sung được cho base mạnh hơn không)
 tests/test_qk_math.py         test chính xác (float64, CPU, kích thước nhỏ)
+tests/test_gptq.py            GPTQ: == RTN khi H chéo, khớp OBS tuần tự, bất biến lattice, + CLC
 ```
 
 Những phần đã bỏ: FlatQuant (`flatquant/`, `src/quantization/flatquant*.py`), bias correction, drift eval, CLI `main.py` cùng các bash wrapper cũ, thư mục `datasets/`.
@@ -145,6 +148,67 @@ Chạy lẻ một lần:
 python run_qk.py --model-path meta-llama/Meta-Llama-3-8B --base rtn --bits 3 \
   --qk-correct full --diag --run-name rtn_qk_test --qk-layers 0-3 --no-eval-ppl
 ```
+
+## Thí nghiệm: GPTQ làm base (T3)
+
+`--base gptq` chạy GPTQ (Frantar et al.) trong cùng pipeline block-sequential và trả ra **cùng lattice** như RTN/AWQ, nên CLC, Q-pass và K-pass chạy trên đó mà không cần sửa gì.
+
+Mặc định: fp32, `--gptq-damp 0.01`, `--gptq-blocksize 128`, act-order bật, dynamic groups, true-sequential bật. Lưới lượng tử là min-max bất đối xứng g128, giống RTN/AWQ ở đây; khác GPTQ gốc ở chỗ range không bị ép chứa số 0.
+
+Ý nghĩa các trường của lattice:
+
+| Trường | GPTQ | RTN/AWQ |
+|---|---|---|
+| `pre_round` | giá trị **đã bù lỗi** w'/scale + zp tại lúc GPTQ làm tròn cột đó | w/scale + zp |
+| `float_weights` | W **gốc** | W (đã nhân scale AWQ) |
+| `scale`, `zero_point` | lưu theo từng phần tử (act-order + dynamic groups thì group không liền nhau, deploy cần `g_idx`; dùng `--gptq-static-groups` nếu cần group liền) | như cũ |
+
+Hệ quả:
+
+- "Flip bù" = chuyển sang mức kề bên kia của `pre_round`, đúng như với RTN/AWQ.
+- CLC sửa đúng mean-shift thật $\mu^\top(W-\hat W)$, vì nó lấy `float_weights` = W gốc.
+- Flip sau GPTQ không cập nhật lại phần bù GPTQ đã tính cho các cột sau. Với W_Q điều này chấp nhận được: đầu ra của q_proj chỉ đi vào logit, và J tính chính xác trên toàn bộ Ŵ.
+
+**True-sequential** (`--gptq-true-sequential`, mặc định bật, chỉ áp dụng cho GPTQ). Mỗi block chạy theo thứ tự:
+
+1. lượng tử `[q,k,v]`;
+2. diag và QK correction;
+3. thu lại input của `o_proj` (qua attention đã sửa) rồi lượng tử `o_proj`;
+4. `[gate,up]`;
+5. `down`.
+
+q/k/v dùng chung một ma trận E[xxᵀ], gate/up cũng vậy. RTN/AWQ vẫn chạy một nhóm duy nhất, kết quả **giữ nguyên bit-for-bit** như trước.
+
+```bash
+python -m pytest tests/test_gptq.py -v                                   # CPU, vài giây
+PHASE=gsmoke bash scripts/llama3_8b/run_8b.sh                            # layer 0-1, bắt lỗi API/OOM
+MODEL_PATH=meta-llama/Llama-3.2-1B BITS=3 EXTRA_ARGS="--diag-split validation" \
+    bash scripts/gptq/run_gptq_ablation.sh                               # dev trên 1B
+PHASE=gptq BITS_LIST="3 4" bash scripts/llama3_8b/run_8b.sh              # 8B, một seed
+STEP=6 bash scripts/llama3_8b/run_8b_final.sh                            # 8B, seeds 42 1 2 (+8K)
+STEP=7 bash scripts/llama3_8b/run_8b_final.sh                            # mean ± std + paired diff
+GPTQ_ARGS="--gptq-static-groups" PHASE=gptq bash scripts/llama3_8b/run_8b.sh   # biến thể deploy được
+```
+
+Các arm chính:
+
+- `gptq`
+- `gptq_clcq`
+- `gptq_qk`
+- `gptq_qkq`
+- `gptq_clc`
+- `gptq_clcnq_qk`
+- `gptq_clcnq_qkq`
+
+Các so sánh quyết định:
+
+- `gptq_qk` − `gptq_clcq`
+- `gptq_clcnq_qk` − `gptq_clc`
+- `gptq_qk` − `gptq`
+
+**Tách dữ liệu.** Mọi sweep hay quyết định cấu hình nên chạy với `--diag-split validation` (KL đo trên WikiText-2 validation). PPL cuối cùng vẫn báo cáo trên test.
+
+**Bộ nhớ (8B).** E[xxᵀ] của `down_proj` là 14336² fp32, khoảng 0.8 GB. Cholesky cần thêm khoảng 2–3 GB tạm. Ở chế độ true-sequential, mỗi lúc chỉ giữ Hessian của một nhóm.
 
 ## Output
 

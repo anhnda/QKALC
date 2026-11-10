@@ -6,6 +6,8 @@
 #   STEP=3 bash scripts/llama3_8b/run_8b_final.sh   # AWQ W3/W4, seed 42, + 8K
 #   STEP=4 bash scripts/llama3_8b/run_8b_final.sh   # lm-eval zero-shot on the key arms (W3)
 #   STEP=5 bash scripts/llama3_8b/run_8b_final.sh   # aggregate seeds (mean +- std)
+#   STEP=6 bash scripts/llama3_8b/run_8b_final.sh   # GPTQ W3/W4, seeds $GPTQ_SEEDS (default 42 1 2), + 8K
+#   STEP=7 bash scripts/llama3_8b/run_8b_final.sh   # aggregate GPTQ seeds
 #   STEP=all ...                                    # 1 -> 5
 # Priority if time is short: 1 > 2 > 3 > 4.  Everything goes to results/llama3_8b_final/.
 set -euo pipefail
@@ -25,6 +27,9 @@ MAIN_RTN=fp,rtn,rtn_clcq,rtn_qk,rtn_qkq,rtn_clc,rtn_clcnq_qk,rtn_clcnq_qkq
 SEED_RTN=rtn_clcq,rtn_qk,rtn_clc,rtn_clcnq_qk,rtn_clcnq_qkq          # rtn / fp are deterministic
 MAIN_AWQ=awq,awq_clcq,awq_qk,awq_clc,awq_clcnq_qk,awq_clcnq_qkq
 LM_RTN=rtn,rtn_clcq,rtn_qk,rtn_clc,rtn_clcnq_qk,rtn_clcnq_qkq
+MAIN_GPTQ=gptq,gptq_clcq,gptq_qk,gptq_clc,gptq_clcnq_qk,gptq_clcnq_qkq
+GPTQ_SEEDS=${GPTQ_SEEDS:-"42 1 2"}       # GPTQ depends on the calibration offsets -> seeds matter
+GPTQ_BITS=${GPTQ_BITS:-"3 4"}
 
 step1() {
   SEED=42 ROOT_OUT=$BASE_OUT/s42 ARMS=$MAIN_RTN BITS_LIST="3 4" EXTRA_ARGS="$USER_EXTRA $CTX" PHASE=rtn bash $R8
@@ -51,12 +56,29 @@ step5() {
   done
 }
 
+step6() {
+  for S in $GPTQ_SEEDS; do
+    SEED=$S ROOT_OUT=$BASE_OUT/s$S ARMS=$MAIN_GPTQ BITS_LIST="$GPTQ_BITS" EXTRA_ARGS="$USER_EXTRA $CTX" PHASE=gptq bash $R8
+  done
+}
+step7() {
+  for B in $GPTQ_BITS; do
+    echo "== GPTQ W${B}: mean +- std over seeds =="
+    dirs=()
+    for S in $GPTQ_SEEDS; do dirs+=("$BASE_OUT/s$S/gptq_w${B}g128"); done
+    python aggregate_seeds.py "${dirs[@]}" --csv $BASE_OUT/seeds_gptq_w${B}.csv \
+      --pairs "gptq_qk:gptq_clcq,gptq_clcnq_qk:gptq_clc,gptq_clcnq_qkq:gptq_clcnq_qk,gptq_qk:gptq"
+  done
+}
+
 case "$STEP" in
   1) step1 ;;
   2) step2 ;;
   3) step3 ;;
   4) step4 ;;
   5) step5 ;;
+  6) step6 ;;
+  7) step7 ;;
   all) step1; step2; step3; step4; step5 ;;
-  *) echo "STEP must be 1..5 or all"; exit 1 ;;
+  *) echo "STEP must be 1..7 or all"; exit 1 ;;
 esac

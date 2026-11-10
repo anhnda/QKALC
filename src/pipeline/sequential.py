@@ -1,13 +1,20 @@
-"""Block-sequential PTQ pipeline: base quantizer (RTN/AWQ) [+ CLC] [+ QK lattice correction].
+"""Block-sequential PTQ pipeline: base quantizer (RTN/AWQ/GPTQ) [+ CLC] [+ QK lattice correction].
 
 For every decoder layer, in order:
-  1. collect activation stats of all Linear inputs (only if AWQ or CLC needs them);
+  1. collect activation stats of all Linear inputs (only if AWQ / GPTQ / CLC needs them);
      inputs come from the already-quantized prefix (block-sequential, GPTQ-style);
   2. quantize every Linear of the block (keep q_proj lattice if QK correction runs);
   3. diagnostics "before" on held-out sequences (attention KL, MQ/QF split);
   4. QK correction of q_proj (K fixed, FP teacher on the same inputs);
   5. diagnostics "after";
   6. propagate calibration / diagnostic hidden states through the quantized block.
+
+With `true_sequential=True` (used for GPTQ by default) steps 1-2 run per sub-group
+[q,k,v] -> [o] -> [gate,up] -> [down], re-collecting the inputs of each sub-group through the
+already-quantized part of the block; steps 3-5 run right after the [q,k,v] group, so o_proj is
+quantized on the attention output of the QK-corrected block. With a single group (RTN / AWQ, the
+default) the behaviour is exactly the original one.
+For GPTQ, inputs shared by several Linears (q/k/v, gate/up) share one second-moment accumulator.
 Supported families: Llama / Mistral / Qwen2 (HF transformers, rotate_half RoPE, no QK-norm).
 """
 
@@ -29,15 +36,27 @@ from src.attention.rope import compute_rope_tables
 from src.post_correction.k_alc import KLatticeCorrector
 from src.post_correction.qk_alc import LatticeHandle, QKLatticeCorrector
 from src.quantization.base import ActStats, quantize_linear, rows_per_call_for
+from src.quantization.gptq import GPTQConfig
+
+BASES = ("rtn", "awq", "gptq")
+# true-sequential sub-groups (by module-name suffix), in execution order
+SEQ_GROUPS = (("q_proj", "k_proj", "v_proj"), ("o_proj",), ("gate_proj", "up_proj"), ("down_proj",))
+# Linears that read the same input tensor (share one GPTQ second moment)
+SHARED_INPUTS = ((("q_proj", "k_proj", "v_proj"), "qkv"), (("gate_proj", "up_proj"), "gate_up"))
 
 
 @dataclass
 class PipelineConfig:
-    base: str = "rtn"                 # rtn | awq
+    base: str = "rtn"                 # rtn | awq | gptq
     bits: int = 4
     group_size: int = 128
     awq_n_grid: int = 20
     awq_max_rows: int = 2048
+    gptq_damp: float = 0.01
+    gptq_blocksize: int = 128
+    gptq_act_order: bool = True
+    gptq_static_groups: bool = False
+    true_sequential: bool = False     # per-sub-group stats inside a block (GPTQ default: True)
     clc_targets: str = "none"         # none | q | all | all_but_q
     qk_layers: Optional[set] = None   # None = all layers (when a QK corrector is given)
     qk_schedule: str = "Q"            # sequence of passes, e.g. "Q", "K", "QK", "QKQ"
@@ -111,6 +130,12 @@ class SequentialPipeline:
         if qk is not None and "K" in sched and kqk is None:
             raise ValueError("schedule contains K but no K corrector was given")
         self.schedule = sched
+        self.gptq_cfg = GPTQConfig(
+            damp=cfg.gptq_damp,
+            blocksize=cfg.gptq_blocksize,
+            act_order=cfg.gptq_act_order,
+            static_groups=cfg.gptq_static_groups,
+        )
         self.device = torch.device(device)
         self.dtype = next(model.parameters()).dtype
         self._mask_cache = {}
@@ -175,6 +200,66 @@ class SequentialPipeline:
         is_q = name.endswith("q_proj")
         return self.clc is not None and (t == "all" or (t == "q" and is_q) or (t == "all_but_q" and not is_q))
 
+    # ------------------------------------------------------------ grouping / statistics
+    def _quant_groups(self, names: list) -> list:
+        """Sub-groups of the block's Linears, in quantization order (one group unless true-sequential)."""
+        if not self.cfg.true_sequential:
+            return [list(names)]
+        groups = [[] for _ in SEQ_GROUPS]
+        rest = []
+        for n in names:
+            for gi, suffixes in enumerate(SEQ_GROUPS):
+                if n.endswith(suffixes):
+                    groups[gi].append(n)
+                    break
+            else:
+                rest.append(n)
+        out = [g for g in groups if g]
+        if rest:
+            out.append(rest)
+        return out
+
+    @staticmethod
+    def _attn_stage_index(groups: list) -> int:
+        """Run diagnostics / QK correction right after the last group holding q_proj or k_proj."""
+        idx = [gi for gi, g in enumerate(groups) if any(n.endswith(("q_proj", "k_proj")) for n in g)]
+        return idx[-1] if idx else len(groups) - 1
+
+    def _stat_key(self, name: str) -> str:
+        if self.cfg.base != "gptq":
+            return name                                   # RTN / AWQ: one accumulator per Linear
+        for suffixes, tag in SHARED_INPUTS:
+            for s in suffixes:
+                if name.endswith(s):
+                    return name[: -len(s)] + tag
+        return name
+
+    @torch.no_grad()
+    def _collect_stats(self, layer, lin: dict, names: list, inps, n_calib: int, n_calls: int) -> dict:
+        cfg = self.cfg
+        need = [n for n in names if cfg.base in ("awq", "gptq") or self._use_clc(n)]
+        if not need:
+            return {}
+        rpc = rows_per_call_for(cfg.awq_max_rows, n_calls) if cfg.base == "awq" else 0
+        by_key, stats, handles = {}, {}, []
+        for n in need:
+            key = self._stat_key(n)
+            if key not in by_key:
+                by_key[key] = ActStats(rows_per_call=rpc, hessian=(cfg.base == "gptq"))
+
+                def hook(_m, inp, _o, k=key):
+                    by_key[k].update(inp[0])
+
+                handles.append(lin[n].register_forward_hook(hook))
+            stats[n] = by_key[key]
+        try:
+            for sl in self._batches(n_calib):
+                self._layer_forward(layer, inps[sl].to(self.device))
+        finally:
+            for hd in handles:
+                hd.remove()
+        return stats
+
     # ------------------------------------------------------------ diagnostics
     @torch.no_grad()
     def _diag(self, layer, geom, diag_inps, Wq, bq, Wk, bk, mu):
@@ -199,6 +284,65 @@ class SequentialPipeline:
             res["kl_interaction_mean"] = res["kl_full"]["mean"] - res["kl_mq"]["mean"] - res["kl_qf"]["mean"]
         return res
 
+    # ------------------------------------------------------------ attention stage (diag + QK)
+    @torch.no_grad()
+    def _attention_stage(self, layer, geom, inps, diag_inps, Wq, bq, Wk, bk, q_lat, k_lat,
+                         do_qk: bool, n_calib: int, rep: dict):
+        cfg = self.cfg
+        attn = layer.self_attn
+
+        # 3. diagnostics before QK correction
+        mu = None
+        if cfg.diag or do_qk:
+            n_mu = cfg.n_opt if cfg.n_opt > 0 else min(16, n_calib)
+            mu = query_mean(self._x_fn(layer, inps), min(n_mu, n_calib), cfg.exclude_first)
+        if diag_inps is not None:
+            rep["diag_before"] = self._diag(layer, geom, diag_inps, Wq, bq, Wk, bk, mu)
+
+        # 4. QK correction (passes in schedule order, e.g. Q, K, Q)
+        if not do_qk:
+            return
+        qh = LatticeHandle.from_lattice_state(q_lat) if q_lat is not None else None
+        kh = LatticeHandle.from_lattice_state(k_lat) if k_lat is not None else None
+        opt_x = self._x_fn(layer, inps, 0)
+        acc_fn = self._x_fn(layer, inps, cfg.n_opt)
+        logs = []
+        for step in self.schedule:
+            Wq_cur = qh.weight() if qh is not None else attn.q_proj.weight.detach().float()
+            Wk_cur = kh.weight() if kh is not None else attn.k_proj.weight.detach().float()
+            if step == "Q":
+                n_acc = cfg.n_acc if self.qk.config.accept == "exact" else 0
+                lg = self.qk.correct(
+                    geom=geom, cos=self.cos32, sin=self.sin32,
+                    opt_x=opt_x, n_opt=cfg.n_opt, acc_x=acc_fn if n_acc > 0 else None, n_acc=n_acc,
+                    Wq_fp=Wq, bq=bq, Wk_fp=Wk, bk=bk, Wk_hat=Wk_cur, lattice=qh, mu=mu,
+                )
+                attn.q_proj.weight.data.copy_(qh.weight().to(attn.q_proj.weight.dtype))
+            else:
+                n_acc = cfg.n_acc if self.kqk.config.accept == "exact" else 0
+                lg = self.kqk.correct(
+                    geom=geom, cos=self.cos32, sin=self.sin32,
+                    opt_x=opt_x, n_opt=cfg.n_opt, acc_x=acc_fn if n_acc > 0 else None, n_acc=n_acc,
+                    Wq_fp=Wq, bq=bq, Wk_fp=Wk, bk=bk, Wq_hat=Wq_cur, lattice=kh,
+                )
+                attn.k_proj.weight.data.copy_(kh.weight().to(attn.k_proj.weight.dtype))
+            logs.append(lg)
+        if qh is not None:
+            qh.write_back(q_lat)
+        if kh is not None:
+            kh.write_back(k_lat)
+        rep["qk"] = merge_pass_logs(logs)
+        rep["qk_passes"] = [
+            {**{k: v for k, v in lg.items() if k != "history"},
+             "history": {k: lg.get("history", {}).get(k, []) for k in ("pred", "acc", "accepted", "nsel")}}
+            for lg in logs
+        ]
+        del qh, kh
+
+        # 5. diagnostics after
+        if diag_inps is not None:
+            rep["diag_after"] = self._diag(layer, geom, diag_inps, Wq, bq, Wk, bk, mu)
+
     # ------------------------------------------------------------ main loop
     @torch.no_grad()
     def run(self, calib_ids, diag_ids=None) -> list:
@@ -209,7 +353,7 @@ class SequentialPipeline:
         qk_on = self.qk is not None
         if qk_on and cfg.n_opt + (cfg.n_acc if self.qk.config.accept == "exact" else 0) > n_calib:
             raise ValueError("n_opt + n_acc exceeds the number of calibration sequences")
-        if cfg.base not in ("rtn", "awq"):
+        if cfg.base not in BASES:
             raise ValueError(f"unknown base {cfg.base}")
 
         inps = self._embed(calib_ids)
@@ -227,101 +371,51 @@ class SequentialPipeline:
             lin = {n: m for n, m in layer.named_modules() if isinstance(m, nn.Linear)}
             do_qk = qk_on and (cfg.qk_layers is None or li in cfg.qk_layers)
 
-            # 1. activation statistics
-            need = {n for n in lin if cfg.base == "awq" or self._use_clc(n)}
-            stats = {}
-            if need:
-                rpc = rows_per_call_for(cfg.awq_max_rows, n_calls) if cfg.base == "awq" else 0
-                handles = []
-                for n in need:
-                    stats[n] = ActStats(rows_per_call=rpc)
-
-                    def hook(_m, inp, _o, key=n):
-                        stats[key].update(inp[0])
-
-                    handles.append(lin[n].register_forward_hook(hook))
-                for sl in self._batches(n_calib):
-                    self._layer_forward(layer, inps[sl].to(self.device))
-                for hd in handles:
-                    hd.remove()
-
-            # 2. FP references for q/k, then quantize the block
+            # FP references for q/k (before anything in this block is quantized)
             attn = layer.self_attn
             Wq = attn.q_proj.weight.detach().float().clone()
             Wk = attn.k_proj.weight.detach().float().clone()
             bq = None if attn.q_proj.bias is None else attn.q_proj.bias.detach().float().clone()
             bk = None if attn.k_proj.bias is None else attn.k_proj.bias.detach().float().clone()
+
             q_lat = k_lat = None
             lin_info = {}
-            for n, m in lin.items():
-                is_q = n.endswith("q_proj")
-                is_k = n.endswith("k_proj")
-                keep = do_qk and ((is_q and "Q" in self.schedule) or (is_k and "K" in self.schedule))
-                lat, info = quantize_linear(
-                    m, cfg.base, cfg.bits, cfg.group_size,
-                    act=stats.get(n), clc=self.clc if self._use_clc(n) else None,
-                    awq_n_grid=cfg.awq_n_grid, awq_max_rows=cfg.awq_max_rows,
-                    keep_state=keep,
-                )
-                if is_q:
-                    q_lat = lat
-                if is_k:
-                    k_lat = lat
-                lin_info[n] = info
-            stats.clear()
-
-            # 3. diagnostics before QK correction
-            mu = None
-            if cfg.diag or do_qk:
-                n_mu = cfg.n_opt if cfg.n_opt > 0 else min(16, n_calib)
-                mu = query_mean(self._x_fn(layer, inps), min(n_mu, n_calib), cfg.exclude_first)
             rep = {"layer": li, "linears": lin_info}
-            if diag_inps is not None:
-                rep["diag_before"] = self._diag(layer, geom, diag_inps, Wq, bq, Wk, bk, mu)
+            groups = self._quant_groups(list(lin))
+            attn_gi = self._attn_stage_index(groups)
+            for gi, names in enumerate(groups):
+                # 1. activation statistics of this group's inputs (through the quantized part so far)
+                stats = self._collect_stats(layer, lin, names, inps, n_calib, n_calls)
 
-            # 4. QK correction (passes in schedule order, e.g. Q, K, Q)
-            if do_qk:
-                qh = LatticeHandle.from_lattice_state(q_lat) if q_lat is not None else None
-                kh = LatticeHandle.from_lattice_state(k_lat) if k_lat is not None else None
-                opt_x = self._x_fn(layer, inps, 0)
-                acc_fn = self._x_fn(layer, inps, cfg.n_opt)
-                logs = []
-                for step in self.schedule:
-                    Wq_cur = qh.weight() if qh is not None else attn.q_proj.weight.detach().float()
-                    Wk_cur = kh.weight() if kh is not None else attn.k_proj.weight.detach().float()
-                    if step == "Q":
-                        n_acc = cfg.n_acc if self.qk.config.accept == "exact" else 0
-                        lg = self.qk.correct(
-                            geom=geom, cos=self.cos32, sin=self.sin32,
-                            opt_x=opt_x, n_opt=cfg.n_opt, acc_x=acc_fn if n_acc > 0 else None, n_acc=n_acc,
-                            Wq_fp=Wq, bq=bq, Wk_fp=Wk, bk=bk, Wk_hat=Wk_cur, lattice=qh, mu=mu,
-                        )
-                        attn.q_proj.weight.data.copy_(qh.weight().to(attn.q_proj.weight.dtype))
-                    else:
-                        n_acc = cfg.n_acc if self.kqk.config.accept == "exact" else 0
-                        lg = self.kqk.correct(
-                            geom=geom, cos=self.cos32, sin=self.sin32,
-                            opt_x=opt_x, n_opt=cfg.n_opt, acc_x=acc_fn if n_acc > 0 else None, n_acc=n_acc,
-                            Wq_fp=Wq, bq=bq, Wk_fp=Wk, bk=bk, Wq_hat=Wq_cur, lattice=kh,
-                        )
-                        attn.k_proj.weight.data.copy_(kh.weight().to(attn.k_proj.weight.dtype))
-                    logs.append(lg)
-                if qh is not None:
-                    qh.write_back(q_lat)
-                if kh is not None:
-                    kh.write_back(k_lat)
-                rep["qk"] = merge_pass_logs(logs)
-                rep["qk_passes"] = [
-                    {**{k: v for k, v in lg.items() if k != "history"},
-                     "history": {k: lg.get("history", {}).get(k, []) for k in ("pred", "acc", "accepted", "nsel")}}
-                    for lg in logs
-                ]
-                del qh, kh
-                if diag_inps is not None:
-                    rep["diag_after"] = self._diag(layer, geom, diag_inps, Wq, bq, Wk, bk, mu)
-            del q_lat, k_lat
+                # 2. quantize the group
+                for n in names:
+                    m = lin[n]
+                    is_q = n.endswith("q_proj")
+                    is_k = n.endswith("k_proj")
+                    keep = do_qk and ((is_q and "Q" in self.schedule) or (is_k and "K" in self.schedule))
+                    lat, info = quantize_linear(
+                        m, cfg.base, cfg.bits, cfg.group_size,
+                        act=stats.get(n), clc=self.clc if self._use_clc(n) else None,
+                        awq_n_grid=cfg.awq_n_grid, awq_max_rows=cfg.awq_max_rows,
+                        keep_state=keep, gptq_cfg=self.gptq_cfg,
+                    )
+                    if is_q:
+                        q_lat = lat
+                    if is_k:
+                        k_lat = lat
+                    lin_info[n] = info
+                stats.clear()
+                del stats
 
-            # 5. propagate
+                # 3-5. diagnostics / QK correction once q_proj and k_proj are quantized
+                if gi == attn_gi:
+                    self._attention_stage(layer, geom, inps, diag_inps, Wq, bq, Wk, bk, q_lat, k_lat,
+                                          do_qk, n_calib, rep)
+                    q_lat = k_lat = None
+                if self.device.type == "cuda" and len(groups) > 1:
+                    torch.cuda.empty_cache()
+
+            # 6. propagate
             inps = self._propagate(layer, inps)
             diag_inps = self._propagate(layer, diag_inps)
             rep["time_s"] = time.time() - t0
@@ -339,9 +433,12 @@ class SequentialPipeline:
                     if q["J_acc_before"] is not None:
                         jb, ja = sum(q["J_acc_before"]), sum(q["J_acc_after"])
                         msg += f" J_acc {jb:.3e}->{ja:.3e}"
+                if cfg.base == "gptq":
+                    gl = sum(v.get("gptq_loss", 0.0) for v in lin_info.values())
+                    msg += f" | gptq_loss={gl:.3e}"
                 print(msg, flush=True)
 
-            del Wq, Wk, bq, bk
+            del Wq, Wk, bq, bk, q_lat, k_lat
             gc.collect()
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()

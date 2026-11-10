@@ -6,6 +6,7 @@ from src.quantization.base import (
     quantize_linear,
     rows_per_call_for,
 )
+from src.quantization.gptq import GPTQConfig, gptq_quantize
 from src.quantization.state import IntegerQuantizedTensorState
 
 __all__ = [
@@ -15,5 +16,7 @@ __all__ = [
     "groupwise_quantize",
     "quantize_linear",
     "rows_per_call_for",
+    "GPTQConfig",
+    "gptq_quantize",
     "IntegerQuantizedTensorState",
 ]

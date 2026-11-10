@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Entry point: base PTQ (RTN / AWQ) [+ CLC] [+ attention-aware QK lattice correction] + evaluation.
+"""Entry point: base PTQ (RTN / AWQ / GPTQ) [+ CLC] [+ attention-aware QK lattice correction] + evaluation.
 
 Examples
 --------
@@ -7,6 +7,9 @@ FP reference:
     python run_qk.py --model-path meta-llama/Meta-Llama-3-8B --base none
 RTN W3 g128 + QK correction, with diagnostics:
     python run_qk.py --model-path meta-llama/Meta-Llama-3-8B --base rtn --bits 3 --qk-correct full --diag
+GPTQ W3 g128 (act-order, true-sequential) + CLC on all but q + Q-pass:
+    python run_qk.py --model-path meta-llama/Meta-Llama-3-8B --base gptq --bits 3 \
+        --clc-targets all_but_q --qk-correct full --diag
 """
 
 from __future__ import annotations
@@ -89,11 +92,20 @@ def build_parser():
     g.add_argument("--allow-tf32", action="store_true", help="faster GEMMs in the correction (lower precision)")
 
     g = ap.add_argument_group("base quantizer")
-    g.add_argument("--base", choices=["none", "rtn", "awq"], default="rtn")
+    g.add_argument("--base", choices=["none", "rtn", "awq", "gptq"], default="rtn")
     g.add_argument("--bits", type=int, default=4)
     g.add_argument("--group-size", type=int, default=128)
     g.add_argument("--awq-n-grid", type=int, default=20)
     g.add_argument("--awq-max-rows", type=int, default=2048)
+    g.add_argument("--gptq-damp", type=float, default=0.01, help="relative damping (x mean diag H)")
+    g.add_argument("--gptq-blocksize", type=int, default=128)
+    g.add_argument("--gptq-act-order", action=argparse.BooleanOptionalAction, default=True,
+                   help="process columns by decreasing diag(H) (desc_act)")
+    g.add_argument("--gptq-static-groups", action=argparse.BooleanOptionalAction, default=False,
+                   help="group params from the original W, contiguous groups (kernel-friendly with act-order)")
+    g.add_argument("--gptq-true-sequential", action=argparse.BooleanOptionalAction, default=True,
+                   help="GPTQ only: quantize [qkv]->[o]->[gate,up]->[down] with re-collected inputs; "
+                        "QK correction runs before o_proj is quantized")
 
     g = ap.add_argument_group("CLC (original repo correction)")
     g.add_argument("--clc-targets", choices=["none", "q", "all", "all_but_q"], default="none")
@@ -144,6 +156,9 @@ def build_parser():
 
     g = ap.add_argument_group("diagnostics")
     g.add_argument("--diag", action="store_true", help="per-layer attention KL (before/after) on held-out seqs")
+    g.add_argument("--diag-split", choices=["test", "validation"], default="test",
+                   help="WikiText-2 split for attention-KL diagnostics; use 'validation' for any tuning/sweep "
+                        "so the test split stays untouched (default 'test' = behaviour of the paper runs)")
     g.add_argument("--diag-seqs", type=int, default=4)
     g.add_argument("--diag-seqlen", type=int, default=None)
     g.add_argument("--diag-head-chunk", type=int, default=4)
@@ -170,6 +185,9 @@ def auto_run_name(args) -> str:
     parts = [model_slug(args.model_path), args.base]
     if args.base != "none":
         parts.append(f"w{args.bits}g{args.group_size}")
+        if args.base == "gptq":
+            parts.append(f"ao{int(args.gptq_act_order)}sg{int(args.gptq_static_groups)}"
+                         f"ts{int(args.gptq_true_sequential)}")
         parts.append(f"clc-{args.clc_targets}")
         qk = args.qk_correct
         if qk != "none":
@@ -191,6 +209,11 @@ def summarize_layers(layers: list) -> dict:
     mems = [l["qk"]["peak_mem_gb"] for l in layers if "qk" in l and l["qk"]["peak_mem_gb"] is not None]
     out["qk_peak_mem_gb"] = max(mems) if mems else None
     out["clc_flips_total"] = int(sum(v.get("clc_flips", 0) for l in layers for v in l["linears"].values()))
+    gl = [v["gptq_loss"] for l in layers for v in l["linears"].values() if "gptq_loss" in v]
+    if gl:
+        out["gptq_loss_total"] = float(sum(gl))
+        out["gptq_damp_max"] = float(max(v["gptq_damp"] for l in layers for v in l["linears"].values()
+                                         if "gptq_damp" in v))
     out["pipeline_time_s"] = float(sum(l["time_s"] for l in layers))
     for stage in ("diag_before", "diag_after"):
         rows = [l[stage] for l in layers if stage in l]
@@ -261,7 +284,7 @@ def main():
         if args.diag:
             diag_ids = get_wikitext2_calibration_data(
                 tok, n_samples=args.diag_seqs, seqlen=args.diag_seqlen or args.calib_seqlen,
-                seed=args.seed + 1, split="test", return_tensors=True, cache_dir=args.calib_cache_dir,
+                seed=args.seed + 1, split=args.diag_split, return_tensors=True, cache_dir=args.calib_cache_dir,
             )
 
         clc = None
@@ -324,6 +347,11 @@ def main():
             group_size=args.group_size,
             awq_n_grid=args.awq_n_grid,
             awq_max_rows=args.awq_max_rows,
+            gptq_damp=args.gptq_damp,
+            gptq_blocksize=args.gptq_blocksize,
+            gptq_act_order=args.gptq_act_order,
+            gptq_static_groups=args.gptq_static_groups,
+            true_sequential=(args.base == "gptq" and args.gptq_true_sequential),
             clc_targets=args.clc_targets,
             qk_layers=parse_layer_spec(args.qk_layers, n_layers),
             qk_schedule=args.qk_schedule.upper(),

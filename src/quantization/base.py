@@ -1,4 +1,7 @@
-"""Base weight quantizers (RTN / AWQ-style) on an explicit integer lattice.
+"""Base weight quantizers (RTN / AWQ-style / GPTQ) on an explicit integer lattice.
+
+GPTQ lives in `src/quantization/gptq.py`; `quantize_linear(..., method="gptq")` dispatches to it
+using the input second moment accumulated by `ActStats(hessian=True)`.
 
 Extracted from the original CLC repo (`src/quantization/awq.py`):
   * `groupwise_quantize`   == `AWQQuantizerXL.quantize_weight_groupwise_raw`
@@ -24,6 +27,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from src.quantization.gptq import GPTQConfig, gptq_quantize
 from src.quantization.state import IntegerQuantizedTensorState
 
 
@@ -102,12 +106,15 @@ def awq_search_scales(
 
 
 class ActStats:
-    """Streaming activation statistics for one Linear input (mean, E[x^2], sampled rows)."""
+    """Streaming activation statistics for one Linear input (mean, E[x^2], sampled rows,
+    optionally the full second moment E[x x^T] for GPTQ)."""
 
-    def __init__(self, rows_per_call: int = 0):
+    def __init__(self, rows_per_call: int = 0, hessian: bool = False):
         self.rows_per_call = int(rows_per_call)
+        self.hessian = bool(hessian)
         self.sum: Optional[torch.Tensor] = None
         self.sumsq: Optional[torch.Tensor] = None
+        self.xtx: Optional[torch.Tensor] = None
         self.n = 0
         self.rows: list[torch.Tensor] = []
 
@@ -119,6 +126,10 @@ class ActStats:
             self.sumsq = torch.zeros(x.shape[1], device=x.device)
         self.sum += x.sum(0)
         self.sumsq += (x * x).sum(0)
+        if self.hessian:
+            if self.xtx is None:
+                self.xtx = torch.zeros(x.shape[1], x.shape[1], device=x.device)
+            self.xtx.addmm_(x.t(), x)
         self.n += x.shape[0]
         if self.rows_per_call > 0:
             idx = torch.randperm(x.shape[0], device=x.device)[: self.rows_per_call]
@@ -129,6 +140,12 @@ class ActStats:
 
     def salience(self) -> torch.Tensor:
         return self.sumsq / max(self.n, 1)
+
+    def second_moment(self) -> torch.Tensor:
+        """E[x x^T] over all calibration tokens (GPTQ Hessian up to the factor 2)."""
+        if self.xtx is None:
+            raise RuntimeError("ActStats was created without hessian=True")
+        return self.xtx / max(self.n, 1)
 
     def sample_rows(self, max_rows: int) -> torch.Tensor:
         rows = torch.cat(self.rows, dim=0)
@@ -164,11 +181,15 @@ def quantize_linear(
     awq_n_grid: int = 20,
     awq_max_rows: int = 2048,
     keep_state: bool = False,
+    gptq_cfg: Optional[GPTQConfig] = None,
 ):
     """Quantize `module.weight` in place (fake-quant, effective weight written in module dtype).
 
-    method: "rtn" | "awq".  `clc` is an optional `CLCCorrection` applied on the lattice
-    (repo semantics: activation means divided by the AWQ input scales).
+    method: "rtn" | "awq" | "gptq".  `clc` is an optional `CLCCorrection` applied on the lattice
+    (repo semantics: activation means divided by the AWQ input scales; ones for RTN / GPTQ).
+    For GPTQ, `act` must carry the second moment (ActStats(hessian=True)); CLC then corrects the
+    true output mean shift mu^T (W - W_hat) (state.float_weights is the original W) and flips to
+    the other neighbour of GPTQ's error-compensated pre_round.
     Returns (LatticeState | None, info dict).
     """
     w = module.weight.data.float()
@@ -184,10 +205,16 @@ def quantize_linear(
         in_scales, alpha, err = awq_search_scales(w, x_rows, act.salience().to(w.device), bits, group_size, awq_n_grid)
         info.update(awq_alpha=alpha, awq_err=err)
         del x_rows
-    elif method != "rtn":
+    elif method not in ("rtn", "gptq"):
         raise ValueError(f"Unknown base method: {method}")
 
-    state = groupwise_quantize(w * in_scales[None, :], bits, group_size)
+    if method == "gptq":
+        if act is None or act.n == 0 or act.xtx is None:
+            raise RuntimeError("GPTQ needs the input second moment (ActStats(hessian=True))")
+        state, ginfo = gptq_quantize(w, act.second_moment().to(w.device), bits, group_size, gptq_cfg)
+        info.update(ginfo)
+    else:
+        state = groupwise_quantize(w * in_scales[None, :], bits, group_size)
 
     if clc is not None:
         if act is not None and act.n > 0:

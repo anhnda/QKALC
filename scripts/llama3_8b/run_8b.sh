@@ -4,6 +4,8 @@
 #   PHASE=smoke bash scripts/llama3_8b/run_8b.sh                  # layers 0-1, no PPL: API / OOM / k_sp check
 #   PHASE=rtn   BITS_LIST="3 4" bash scripts/llama3_8b/run_8b.sh  # RTN arms
 #   PHASE=awq   BITS_LIST="3 4" bash scripts/llama3_8b/run_8b.sh  # AWQ arms
+#   PHASE=gptq  BITS_LIST="3 4" bash scripts/llama3_8b/run_8b.sh  # GPTQ arms (GPTQ_ARGS="..." for variants)
+#   PHASE=gsmoke bash scripts/llama3_8b/run_8b.sh                 # GPTQ + QKQ on layers 0-1, no PPL
 #   PHASE=all   bash scripts/llama3_8b/run_8b.sh
 #   ARMS=rtn,rtn_qkq PHASE=rtn bash scripts/llama3_8b/run_8b.sh   # subset of arms
 #
@@ -32,6 +34,16 @@ if [[ "$PHASE" == "smoke" ]]; then
   exit 0
 fi
 
+if [[ "$PHASE" == "gsmoke" ]]; then
+  OUT="$ROOT_OUT/smoke"; mkdir -p "$OUT"
+  BITS=3
+  run_arm "$OUT" smoke_gptq_clcnq_qkq --base gptq --clc-targets all_but_q "${QK[@]}" --qk-schedule QKQ \
+          --qk-layers 0-1 --n-calib 32 --qk-opt-seqs 16 --qk-accept-seqs 8 --diag-seqs 2 --no-eval-ppl
+  summ "$OUT"
+  echo ">>> check: no error, gptq_loss printed per layer, KL_full decreases on layers 0-1"
+  exit 0
+fi
+
 if [[ "$PHASE" == "rtn" || "$PHASE" == "all" ]]; then
   if want_arm fp && [[ ! -f "$ROOT_OUT/fp/fp/summary.json" ]]; then
     mkdir -p "$ROOT_OUT/fp"; run_arm "$ROOT_OUT/fp" fp --base none
@@ -46,6 +58,21 @@ if [[ "$PHASE" == "rtn" || "$PHASE" == "all" ]]; then
     want_arm rtn_clcnq_qk        && run_arm "$OUT" rtn_clcnq_qk        --base rtn --clc-targets all_but_q "${QK[@]}" --qk-schedule Q
     want_arm rtn_clcnq_qkq       && run_arm "$OUT" rtn_clcnq_qkq       --base rtn --clc-targets all_but_q "${QK[@]}" --qk-schedule QKQ
     want_arm rtn_clcnq_qkqkq     && run_arm "$OUT" rtn_clcnq_qkqkq     --base rtn --clc-targets all_but_q "${QK[@]}" --qk-schedule QKQKQ
+    summ "$OUT"
+  done
+fi
+
+if [[ "$PHASE" == "gptq" || "$PHASE" == "all" ]]; then
+  G=(--base gptq ${GPTQ_ARGS:-})
+  for BITS in $BITS_LIST; do
+    OUT="$ROOT_OUT/gptq_w${BITS}g${GS}"; mkdir -p "$OUT"
+    want_arm gptq                && run_arm "$OUT" gptq                "${G[@]}"
+    want_arm gptq_clcq           && run_arm "$OUT" gptq_clcq           "${G[@]}" --clc-targets q
+    want_arm gptq_qk             && run_arm "$OUT" gptq_qk             "${G[@]}" "${QK[@]}" --qk-schedule Q
+    want_arm gptq_qkq            && run_arm "$OUT" gptq_qkq            "${G[@]}" "${QK[@]}" --qk-schedule QKQ
+    want_arm gptq_clc            && run_arm "$OUT" gptq_clc            "${G[@]}" --clc-targets all
+    want_arm gptq_clcnq_qk       && run_arm "$OUT" gptq_clcnq_qk       "${G[@]}" --clc-targets all_but_q "${QK[@]}" --qk-schedule Q
+    want_arm gptq_clcnq_qkq      && run_arm "$OUT" gptq_clcnq_qkq      "${G[@]}" --clc-targets all_but_q "${QK[@]}" --qk-schedule QKQ
     summ "$OUT"
   done
 fi
